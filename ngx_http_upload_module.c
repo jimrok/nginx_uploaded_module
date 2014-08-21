@@ -3,6 +3,11 @@
  * Client body reception code Copyright (c) 2002-2007 Igor Sysoev
  * Temporary file name generation code Copyright (c) 2002-2007 Igor Sysoev
  */
+
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
@@ -25,6 +30,8 @@
 #else
 #include <sha.h>
 #endif
+
+#include <magick/api.h>
 
 #define MULTIPART_FORM_DATA_STRING              "multipart/form-data"
 #define BOUNDARY_STRING                         "boundary="
@@ -338,6 +345,17 @@ static ngx_path_init_t        ngx_http_upload_temp_path = {
     ngx_string(NGX_HTTP_PROXY_TEMP_PATH), { 1, 2, 0 }
 };
 #endif
+
+enum NGX_HTTP_UPLOAD_FILE_FORMAT {
+    NGX_HTTP_UPLOAD_FILE_UNKNOWN = 0,
+    NGX_HTTP_UPLOAD_FILE_IMAGE = 1,
+    NGX_HTTP_UPLOAD_FILE_PDF = 2,
+    NGX_HTTP_UPLOAD_FILE_VIDEO = 3,
+    NGX_HTTP_UPLOAD_FILE_AUDIO = 4,
+};
+
+static ngx_int_t ngx_http_file_format(ngx_http_upload_ctx_t *u);
+static ngx_int_t ngx_http_file_thumbnail(ngx_http_upload_ctx_t *u, ngx_int_t format);
 
 /*
  * upload_init_ctx
@@ -1561,6 +1579,8 @@ static void ngx_http_upload_finish_handler(ngx_http_upload_ctx_t *u) { /* {{{ */
                     goto rollback;
             }
         }
+        rc = ngx_http_file_format(u);
+        ngx_http_file_thumbnail(u, rc);
     }
 
     // Checkpoint current output chain state
@@ -4283,3 +4303,162 @@ ngx_http_upload_test_expect(ngx_http_request_t *r)
 
     return NGX_ERROR;
 } /* }}} */
+
+static ngx_int_t /* {{{ */
+ngx_http_file_format(ngx_http_upload_ctx_t *u)
+{
+    int fd = -1, n = 0;
+    ngx_file_t  *file = &u->output_file;
+    unsigned char buf[8];
+    unsigned char jpeg[] = {0xFF, 0xD8, 0xFF};
+    unsigned char png[] = {0x89, 0x50, 0x4E, 0x47};
+    unsigned char gif[] = {0x47, 0x49, 0x46, 0x38};
+    unsigned char tiff[] = {0x49, 0x49, 0x2A};
+    unsigned char bmp[] = {0x42, 0x4D};
+    unsigned char pdf[] = {0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E};
+    
+    fd = open(file->name.data, O_RDONLY);
+    if (fd == NGX_INVALID_FILE) {
+        err = ngx_errno;
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "failed to identifyfile format for \"%V\"", &file->name);
+        return NGX_UPLOAD_IOERROR;
+    }
+    memset(buf, 0x00, sizeof(buf));
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n < 7) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
+                      "failed to read from \"%V\"", &file->name);
+        return NGX_UPLOAD_IOERROR;
+    }
+
+    if (0 == memcmp(buf, jpeg, sizeof(jpeg))) {
+        n = NGX_HTTP_UPLOAD_FILE_IMAGE;
+    }
+    else if (0 == memcmp(buf, png, sizeof(png))) {
+        n = NGX_HTTP_UPLOAD_FILE_IMAGE;
+    }
+    else if (0 == memcmp(buf, gif, sizeof(png))) {
+        n = NGX_HTTP_UPLOAD_FILE_IMAGE;
+    }
+    else if (0 == memcmp(buf, tiff, sizeof(tiff))) {
+        n = NGX_HTTP_UPLOAD_FILE_IMAGE;
+    }
+    else if (0 == memcmp(buf, bmp, sizeof(bmp))) {
+        n = NGX_HTTP_UPLOAD_FILE_IMAGE;
+    }
+    else if (0 == memcmp(buf, pdf, sizeof(pdf))) {
+        n = NGX_HTTP_UPLOAD_FILE_PDF;
+    }
+    else {
+        n = NGX_HTTP_UPLOAD_FILE_UNKNOWN;
+    }
+    
+    return n;
+} /* }}} */
+
+static ngx_int_t /* {{{ */
+ngx_http_file_thumbnail(ngx_http_upload_ctx_t *u, ngx_int_t format)
+{
+    Image* image = NULL;
+    Image *resize_image = NULL;
+    ImageInfo* imageInfo = NULL;
+    ExceptionInfo exception;
+    char* infile = NULL;
+    char* outfile = NULL;
+    size_t len = 0;
+    int rc = 0;
+    
+    switch (format) {
+        case NGX_HTTP_UPLOAD_FILE_IMAGE:
+            len = file->name.len + 1;
+            infile = (char*)malloc(len);
+            if (!infile) {
+                return NGX_UPLOAD_NOMEM;
+            }
+            memset(infile, 0x00, len);
+            memcpy(infile, file->name.data, file->name.len);
+            break;
+        case NGX_HTTP_UPLOAD_FILE_PDF:
+            len = file->name.len + 4;
+            infile = (char*)malloc(len);
+            if (!infile) {
+                return NGX_UPLOAD_NOMEM;
+            }
+            memset(infile, 0x00, len);
+            snprintf(infile, len - 1, "%s[0]", file->name.data);
+            break;
+        case NGX_HTTP_UPLOAD_FILE_VIDEO:
+        case NGX_HTTP_UPLOAD_FILE_AUDIO:
+        default:
+            return 0;
+            break;
+    }
+    
+    len = file->name.len + strlen("thumbnail.jpg") + 1;
+    outfile = (char*)malloc(len);
+    if (!outfile) {
+        rc = NGX_UPLOAD_NOMEM;
+        goto program_exit;
+    }
+    memset(outfile, 0x00, len);
+    snprintf(outfile, len - 1, "%s.thumbnail.jpg", file->name.data);
+    
+    InitializeMagick(NULL);
+    imageInfo=CloneImageInfo(0);
+    GetExceptionInfo(&exception);
+    strcpy(imageInfo->filename, infile);
+    image = ReadImage(imageInfo, &exception);
+    
+    if (image == NULL) {
+        CatchException(&exception);
+        rc = NGX_UPLOAD_MALFORMED;
+        goto program_exit;
+    }
+
+    resize_image = ResizeImage(image,
+                               image->columns >= image->rows ? 90 : 90.0*image->columns/image->rows,
+                               image->columns <= image->rows ? 90 : 90.0*image->rows/image->columns,
+                               LanczosFilter, 1.0, &exception);
+    
+    if (resize_image == NULL) {
+        CatchException(&exception);
+        rc = NGX_UPLOAD_MALFORMED;
+        goto program_exit;
+    }
+    
+    (void) strcpy(resize_image->filename, outfile);
+    if (!WriteImage (imageInfo,resize_image))
+    {
+        CatchException(&resize_image->exception);
+        rc = NGX_UPLOAD_IOERROR;
+        goto program_exit;
+    }
+    
+program_exit:
+    if (infile) {
+        free(infile);
+        infile = NULL;
+    }
+    if (outfile) {
+        free(outfile);
+        outfile = NULL;
+    }
+    if (image) {
+        DestroyImage(image);
+        image = NULL;
+    }
+    if (resize_image) {
+        DestroyImage(resize_image);
+        resize_image = NULL;
+    }
+    if (imageInfo) {
+        DestroyImageInfo(imageInfo);
+        imageInfo = NULL;
+    }
+    DestroyMagick();
+    
+    return rc;
+} /* }}} */
+
