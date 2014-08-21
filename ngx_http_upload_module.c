@@ -4308,7 +4308,8 @@ static ngx_int_t /* {{{ */
 ngx_http_file_format(ngx_http_upload_ctx_t *u)
 {
     int fd = -1, n = 0;
-    ngx_file_t  *file = &u->output_file;
+    ngx_http_request_t *r = u->request;
+    ngx_file_t *file = &u->output_file;
     unsigned char buf[8];
     unsigned char jpeg[] = {0xFF, 0xD8, 0xFF};
     unsigned char png[] = {0x89, 0x50, 0x4E, 0x47};
@@ -4317,9 +4318,8 @@ ngx_http_file_format(ngx_http_upload_ctx_t *u)
     unsigned char bmp[] = {0x42, 0x4D};
     unsigned char pdf[] = {0x25, 0x50, 0x44, 0x46, 0x2D, 0x31, 0x2E};
     
-    fd = open(file->name.data, O_RDONLY);
+    fd = open((const char*)file->name.data, O_RDONLY);
     if (fd == NGX_INVALID_FILE) {
-        err = ngx_errno;
         ngx_log_error(NGX_LOG_ERR, r->connection->log, ngx_errno,
                       "failed to identifyfile format for \"%V\"", &file->name);
         return NGX_UPLOAD_IOERROR;
@@ -4361,8 +4361,9 @@ ngx_http_file_format(ngx_http_upload_ctx_t *u)
 static ngx_int_t /* {{{ */
 ngx_http_file_thumbnail(ngx_http_upload_ctx_t *u, ngx_int_t format)
 {
+    ngx_file_t *file = &u->output_file;
     Image* image = NULL;
-    Image *resize_image = NULL;
+    Image* resize_image = NULL;
     ImageInfo* imageInfo = NULL;
     ExceptionInfo exception;
     char* infile = NULL;
